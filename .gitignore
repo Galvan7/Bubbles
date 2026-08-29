@@ -16,6 +16,7 @@ suggest_*.json
 # Local config / secrets
 .env
 .env.*
+!.env.example
 
 # Editor & OS noise
 .vscode/
