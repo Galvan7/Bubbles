@@ -27,6 +27,7 @@ const (
 	modeVideos
 	modeActions
 	modeCategorizing
+	modeSuggesting
 	modeReport
 )
 
@@ -74,10 +75,7 @@ func Run() error {
 	if err != nil {
 		return err
 	}
-	cfg, err := ai.NewConfig("gemini")
-	if err != nil {
-		return err
-	}
+	cfg := ai.NewConfig()
 	p := tea.NewProgram(newApp(client, cfg), tea.WithAltScreen())
 	_, err = p.Run()
 	return err
@@ -132,6 +130,8 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, waitCategoryProgress(a.progressCh)
 	case categoryDoneMsg:
 		return a.onCategoryDone(msg)
+	case suggestDoneMsg:
+		return a.onSuggestDone(msg)
 	}
 	return a, nil
 }
@@ -173,9 +173,9 @@ func (a *app) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.viewport, cmd = a.viewport.Update(msg)
 		return a, cmd
 
-	case modeCategorizing:
+	case modeCategorizing, modeSuggesting:
 		if msg.String() == "esc" {
-			a.status = "Classification still running in the background. Esc again once it finishes."
+			a.status = "Still running in the background. Esc again once it finishes."
 		}
 	}
 
@@ -208,7 +208,7 @@ func (a *app) selectCurrent() (tea.Model, tea.Cmd) {
 		case actReCat:
 			return a.startCategorizing(true)
 		case actSuggest:
-			a.status = "Song suggestions arrive in Phase 3."
+			return a.startSuggesting()
 		}
 	case modeVideos:
 		if err := yt.OpenURL(i.value); err != nil {
@@ -253,6 +253,47 @@ func (a *app) startCategorizing(fresh bool) (tea.Model, tea.Cmd) {
 	return a, tea.Batch(
 		waitCategoryProgress(progressCh),
 		waitCategoryDone(doneCh),
+	)
+}
+
+func (a *app) startSuggesting() (tea.Model, tea.Cmd) {
+	if err := a.aiCfg.RequireKey(); err != nil {
+		a.status = err.Error()
+		return a, nil
+	}
+	g, err := a.aiCfg.NewGemini(context.Background())
+	if err != nil {
+		a.status = err.Error()
+		return a, nil
+	}
+
+	a.mode = modeSuggesting
+	a.progress.Reset()
+	a.viewport.SetContent("Preparing suggestions...")
+	a.viewport.GotoBottom()
+
+	progressCh := make(chan string, 16)
+	doneCh := make(chan suggestDoneMsg, 1)
+	a.progressCh = progressCh
+	progressFn := func(format string, args ...any) {
+		progressCh <- fmt.Sprintf(format, args...)
+	}
+
+	go func() {
+		songs, err := analyze.Categorize(context.Background(), g, a.client, a.selected, ".", false, progressFn)
+		if err == nil {
+			progressFn("Generating song suggestions with Gemini...")
+			recs, jerr := analyze.Suggest(context.Background(), g, songs)
+			doneCh <- suggestDoneMsg{recs: recs, err: jerr}
+		} else {
+			doneCh <- suggestDoneMsg{err: err}
+		}
+		close(progressCh)
+	}()
+
+	return a, tea.Batch(
+		waitCategoryProgress(progressCh),
+		waitSuggestDone(doneCh),
 	)
 }
 
@@ -306,6 +347,21 @@ func (a *app) onCategoryDone(msg categoryDoneMsg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+func (a *app) onSuggestDone(msg suggestDoneMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		a.status = "Suggestions failed: " + msg.err.Error()
+		a.mode = modeActions
+		a.rebuildList(actionItems(), fmt.Sprintf("Actions — %s", a.selectedTitle()))
+		return a, nil
+	}
+	a.mode = modeReport
+	a.report = renderRecommendations(msg.recs)
+	a.viewport.SetContent(a.report)
+	a.viewport.GotoTop()
+	a.status = fmt.Sprintf("Recommended %d songs", len(msg.recs))
+	return a, nil
+}
+
 func (a *app) rebuildList(items []list.Item, title string) {
 	a.list.Title = title
 	a.list.SetItems(items)
@@ -332,6 +388,8 @@ func (a *app) View() string {
 		body = a.list.View()
 	case modeCategorizing:
 		body = lipgloss.NewStyle().Padding(0, 1).Render(a.spinner.View()+" Classifying...") + "\n\n" + a.viewport.View()
+	case modeSuggesting:
+		body = lipgloss.NewStyle().Padding(0, 1).Render(a.spinner.View()+" Generating suggestions...") + "\n\n" + a.viewport.View()
 	case modeReport:
 		body = a.viewport.View()
 	}
@@ -354,6 +412,8 @@ func (a *app) helpText() string {
 		return "↑/↓ browse · Enter open video in browser · Esc back · q quit"
 	case modeCategorizing:
 		return "Classifying... (this can take a minute or two) · ctrl+c quit"
+	case modeSuggesting:
+		return "Generating suggestions... · ctrl+c quit"
 	case modeReport:
 		return "↑/↓ scroll · Esc back · q quit"
 	}
@@ -363,6 +423,14 @@ func (a *app) helpText() string {
 func renderReport(songs []analyze.Song) string {
 	var sb strings.Builder
 	if err := analyze.PrintReport(songs, &sb); err != nil {
+		return err.Error()
+	}
+	return sb.String()
+}
+
+func renderRecommendations(recs []analyze.Recommendation) string {
+	var sb strings.Builder
+	if err := analyze.PrintRecommendations(recs, &sb); err != nil {
 		return err.Error()
 	}
 	return sb.String()
@@ -385,7 +453,7 @@ func actionItems() []list.Item {
 		item{title: "View videos", desc: "Browse all songs in this playlist", value: actVideos},
 		item{title: "Categorize", desc: "Classify into Party/Love/Workout/Chill/Sad/Other (uses saved cache)", value: actCategorize},
 		item{title: "Re-categorize", desc: "Force a fresh classification, ignoring the saved cache", value: actReCat},
-		item{title: "Suggest", desc: "Discover songs you're missing (Phase 3)", value: actSuggest},
+		item{title: "Suggest", desc: "Discover songs you're missing based on this playlist", value: actSuggest},
 	}
 }
 
@@ -421,6 +489,11 @@ type categoryDoneMsg struct {
 	err   error
 }
 
+type suggestDoneMsg struct {
+	recs []analyze.Recommendation
+	err  error
+}
+
 func loadPlaylistsCmd(cl *yt.Client) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
@@ -448,6 +521,12 @@ func waitCategoryProgress(ch <-chan string) tea.Cmd {
 }
 
 func waitCategoryDone(ch <-chan categoryDoneMsg) tea.Cmd {
+	return func() tea.Msg {
+		return <-ch
+	}
+}
+
+func waitSuggestDone(ch <-chan suggestDoneMsg) tea.Cmd {
 	return func() tea.Msg {
 		return <-ch
 	}

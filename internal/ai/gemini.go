@@ -18,12 +18,9 @@ type Gemini struct {
 }
 
 func (c *Config) NewGemini(ctx context.Context) (*Gemini, error) {
-	if c.Provider != ProviderGemini {
-		return nil, fmt.Errorf("provider %q has no AI backend implemented yet (supported: gemini)", c.Provider)
-	}
-	key := os.Getenv(c.KeyEnv())
+	key := os.Getenv(apiKeyEnv)
 	if key == "" {
-		return nil, fmt.Errorf("missing %s (see .env.example)", c.KeyEnv())
+		return nil, fmt.Errorf("missing %s (see .env.example)", apiKeyEnv)
 	}
 	client, err := genai.NewClient(ctx, option.WithAPIKey(key))
 	if err != nil {
