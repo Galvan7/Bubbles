@@ -46,11 +46,16 @@ type cachedCategorization struct {
 	Songs      []Song    `json:"songs"`
 }
 
-func Categorize(ctx context.Context, g *ai.Gemini, ytClient *yt.Client, playlist *youtube.Playlist, workDir string, fresh bool) ([]Song, error) {
+type ProgressFunc func(format string, args ...any)
+
+func Categorize(ctx context.Context, g *ai.Gemini, ytClient *yt.Client, playlist *youtube.Playlist, workDir string, fresh bool, onProgress ProgressFunc) ([]Song, error) {
+	if onProgress == nil {
+		onProgress = func(string, ...any) {}
+	}
 	cachePath := filepath.Join(workDir, categorizeCachePrefix+playlist.Id+".json")
 	if !fresh {
 		if cached, err := loadCache(cachePath, playlist.Id); err == nil {
-			fmt.Printf("Using cached analysis from %s (use --fresh to reclassify).\n", cached.Generated.Format("2006-01-02 15:04"))
+			onProgress("Using cached analysis from %s (use Re-categorize to reclassify).", cached.Generated.Format("2006-01-02 15:04"))
 			return cached.Songs, nil
 		}
 	}
@@ -59,7 +64,7 @@ func Categorize(ctx context.Context, g *ai.Gemini, ytClient *yt.Client, playlist
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("Fetched %d items\n", len(items))
+	onProgress("Fetched %d items", len(items))
 
 	ids := make([]string, len(items))
 	for i, it := range items {
@@ -118,7 +123,7 @@ func Categorize(ctx context.Context, g *ai.Gemini, ytClient *yt.Client, playlist
 			}
 			instruction = correctiveCategoryInstruction
 		}
-		fmt.Printf("Classified chunk %d/%d (%d tracks)\n", ci+1, len(chunks), len(chunk))
+		onProgress("Classified chunk %d/%d (%d tracks)", ci+1, len(chunks), len(chunk))
 	}
 
 	if err := saveCache(cachePath, playlist, songs); err != nil {

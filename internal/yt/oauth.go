@@ -94,7 +94,9 @@ func getTokenFromWeb(config *oauth2.Config, tokenFile string) (*oauth2.Token, er
 
 	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
 	fmt.Printf("\nTo authorize this app, open this URL in your browser:\n\n  %s\n", authURL)
-	openBrowser(authURL)
+	if err := openBrowser(authURL); err != nil {
+		fmt.Printf("Could not open your browser automatically. Please open the URL above manually.\n")
+	}
 
 	codeCh := make(chan string, 1)
 	errCh := make(chan error, 1)
@@ -146,7 +148,7 @@ func getTokenFromWeb(config *oauth2.Config, tokenFile string) (*oauth2.Token, er
 	return tok, nil
 }
 
-func openBrowser(url string) {
+func openBrowser(url string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
@@ -157,6 +159,12 @@ func openBrowser(url string) {
 		cmd = exec.Command("xdg-open", url)
 	}
 	if err := cmd.Start(); err != nil {
-		fmt.Printf("\nCould not open your browser automatically. Please open the URL above manually.\n")
+		return fmt.Errorf("could not open browser: %v", err)
 	}
+	return nil
+}
+
+// OpenURL opens url in the user's default browser. Safe to call from the TUI.
+func OpenURL(url string) error {
+	return openBrowser(url)
 }
