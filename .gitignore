@@ -1,0 +1,27 @@
+# Binaries & build output
+bubbles
+/bubbles/
+*.exe
+*.test
+*.out
+
+# OAuth credentials & cached tokens — NEVER commit these
+token.json
+client_secret_*.json
+
+# AI analysis caches (regenerable)
+categorize_*.json
+suggest_*.json
+
+# Local config / secrets
+.env
+.env.*
+
+# Editor & OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Go toolchain artifacts
+vendor/
