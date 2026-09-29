@@ -86,6 +86,66 @@ func (c *Client) PlaylistVideos(ctx context.Context, playlistID string) ([]*yout
 	return items, nil
 }
 
+// PlaylistVideosPage fetches a single page (up to pageSize, max 50) of a
+// playlist's videos. It returns the items, the token for the next page ("" if
+// none), and the total number of videos in the playlist.
+func (c *Client) PlaylistVideosPage(ctx context.Context, playlistID, pageToken string, pageSize int64) (items []*youtube.PlaylistItem, nextPageToken string, total int64, err error) {
+	if pageSize <= 0 || pageSize > 50 {
+		pageSize = 50
+	}
+	call := c.svc.PlaylistItems.List([]string{"snippet", "contentDetails"}).
+		PlaylistId(playlistID).
+		MaxResults(pageSize)
+	if pageToken != "" {
+		call = call.PageToken(pageToken)
+	}
+	resp, err := call.Context(ctx).Do()
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("unable to retrieve playlist items: %v", err)
+	}
+	total = 0
+	if resp.PageInfo != nil {
+		total = resp.PageInfo.TotalResults
+	}
+	return resp.Items, resp.NextPageToken, total, nil
+}
+
+// CreatePlaylist creates a new (private) playlist and returns it.
+func (c *Client) CreatePlaylist(ctx context.Context, title, description string) (*youtube.Playlist, error) {
+	pl := &youtube.Playlist{
+		Snippet: &youtube.PlaylistSnippet{
+			Title:       title,
+			Description: description,
+		},
+		Status: &youtube.PlaylistStatus{
+			PrivacyStatus: "private",
+		},
+	}
+	created, err := c.svc.Playlists.Insert([]string{"snippet", "status"}, pl).Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("unable to create playlist: %v", err)
+	}
+	return created, nil
+}
+
+// AddToPlaylist appends a single video to a playlist by video ID.
+func (c *Client) AddToPlaylist(ctx context.Context, playlistID, videoID string) error {
+	item := &youtube.PlaylistItem{
+		Snippet: &youtube.PlaylistItemSnippet{
+			PlaylistId: playlistID,
+			ResourceId: &youtube.ResourceId{
+				Kind:    "youtube#video",
+				VideoId: videoID,
+			},
+		},
+	}
+	_, err := c.svc.PlaylistItems.Insert([]string{"snippet"}, item).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("unable to add video %s to playlist: %v", videoID, err)
+	}
+	return nil
+}
+
 func (c *Client) Videos(ctx context.Context, ids []string) (map[string]*youtube.Video, error) {
 	byID := make(map[string]*youtube.Video)
 	const batch = 50

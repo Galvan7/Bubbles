@@ -42,7 +42,8 @@ func newOAuthConfig(credPath string) (*oauth2.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to read credentials file %s: %v", credPath, err)
 	}
-	config, err := google.ConfigFromJSON(data, youtube.YoutubeReadonlyScope)
+	// YoutubeScope grants read + write access (needed to create playlists and add items).
+	config, err := google.ConfigFromJSON(data, youtube.YoutubeScope)
 	if err != nil {
 		return nil, fmt.Errorf("unable to parse credentials file %s: %v", credPath, err)
 	}

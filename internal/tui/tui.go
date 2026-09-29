@@ -3,10 +3,12 @@ package tui
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -29,6 +31,9 @@ const (
 	modeCategorizing
 	modeSuggesting
 	modeReport
+	modeCreating
+	modePicking
+	modeNamePrompt
 )
 
 const (
@@ -36,17 +41,70 @@ const (
 	actCategorize = "categorize"
 	actReCat      = "recategorize"
 	actSuggest    = "suggest"
+	actPick       = "pick"
 )
 
 type item struct {
-	title string
-	desc  string
-	value string
+	title   string
+	desc    string
+	value   string
+	videoID string
+	checked bool
 }
 
 func (i item) Title() string       { return i.title }
-func (i item) Description() string { return i.desc }
+func (i item) Description() string  { return i.desc }
 func (i item) FilterValue() string { return i.title }
+
+// checkDelegate renders list items with a checkbox reflecting the checked set.
+type checkDelegate struct {
+	base    list.DefaultDelegate
+	checked map[string]bool
+}
+
+func newCheckDelegate() *checkDelegate {
+	return &checkDelegate{base: list.NewDefaultDelegate(), checked: map[string]bool{}}
+}
+
+func (d *checkDelegate) Height() int                             { return d.base.Height() }
+func (d *checkDelegate) Spacing() int                            { return d.base.Spacing() }
+func (d *checkDelegate) Update(msg tea.Msg, m *list.Model) tea.Cmd { return d.base.Update(msg, m) }
+
+func (d *checkDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
+	it, ok := listItem.(item)
+	if !ok {
+		d.base.Render(w, m, index, listItem)
+		return
+	}
+	box := "[ ] "
+	if d.checked[it.videoID] {
+		box = "[x] "
+	}
+	// Prefix the checkbox onto the title and delegate the rest of the rendering.
+	it.title = box + it.title
+	d.base.Render(w, m, index, it)
+}
+
+func (d *checkDelegate) count() int {
+	n := 0
+	for _, v := range d.checked {
+		if v {
+			n++
+		}
+	}
+	return n
+}
+
+// chosenInOrder returns the checked items in their original list order.
+func chosenInOrder(items []list.Item, checked map[string]bool) []item {
+	var out []item
+	for _, li := range items {
+		if it, ok := li.(item); ok && checked[it.videoID] {
+			out = append(out, it)
+		}
+	}
+	return out
+}
 
 type app struct {
 	client    *yt.Client
@@ -58,6 +116,11 @@ type app struct {
 	spinner    spinner.Model
 	list       list.Model
 	viewport   viewport.Model
+	nameInput  textinput.Model
+	pickDelegate *checkDelegate
+	pickNextToken string
+	pickTotal     int64
+	pickLoaded    int
 	progress   *strings.Builder
 	report     string
 	fresh      bool
@@ -123,6 +186,8 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a.onPlaylistsLoaded(msg)
 	case videosLoadedMsg:
 		return a.onVideosLoaded(msg)
+	case pickerLoadedMsg:
+		return a.onPickerLoaded(msg)
 	case categoryProgressMsg:
 		a.progress.WriteString(msg.line + "\n")
 		a.viewport.SetContent(a.progress.String())
@@ -132,11 +197,77 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a.onCategoryDone(msg)
 	case suggestDoneMsg:
 		return a.onSuggestDone(msg)
+	case rangeDoneMsg:
+		return a.onRangeDone(msg)
 	}
 	return a, nil
 }
 
 func (a *app) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Picker: space toggles the highlighted item, c creates, esc goes back.
+	if a.mode == modePicking {
+		// Let the list handle keys while the filter box is open.
+		if a.list.FilterState() == list.Filtering {
+			var cmd tea.Cmd
+			a.list, cmd = a.list.Update(msg)
+			return a, cmd
+		}
+		switch msg.String() {
+		case "ctrl+c":
+			return a, tea.Quit
+		case "esc":
+			a.mode = modeActions
+			a.pickDelegate = nil
+			a.rebuildList(actionItems(), fmt.Sprintf("Actions — %s", a.selectedTitle()))
+			a.status = ""
+			return a, nil
+		case " ":
+			if it, ok := a.list.SelectedItem().(item); ok && it.videoID != "" {
+				a.pickDelegate.checked[it.videoID] = !a.pickDelegate.checked[it.videoID]
+				a.status = fmt.Sprintf("%d selected", a.pickDelegate.count())
+			}
+			return a, nil
+		case "c", "enter":
+			if a.pickDelegate.count() == 0 {
+				a.status = "Nothing selected yet. Use Space to tick videos."
+				return a, nil
+			}
+			return a.openNamePrompt()
+		case "m":
+			if a.pickNextToken == "" {
+				a.status = fmt.Sprintf("All %d videos loaded.", a.pickLoaded)
+				return a, nil
+			}
+			a.status = "Loading more..."
+			return a, loadPickerPageCmd(a.client, a.selected.Id, a.pickNextToken)
+		}
+		var cmd tea.Cmd
+		a.list, cmd = a.list.Update(msg)
+		return a, cmd
+	}
+
+	// Name prompt: type the new playlist's name.
+	if a.mode == modeNamePrompt {
+		switch msg.String() {
+		case "ctrl+c":
+			return a, tea.Quit
+		case "esc":
+			a.mode = modePicking
+			a.status = fmt.Sprintf("%d selected", a.pickDelegate.count())
+			return a, nil
+		case "enter":
+			name := strings.TrimSpace(a.nameInput.Value())
+			if name == "" {
+				a.status = "Please enter a name."
+				return a, nil
+			}
+			return a.startCreateFromSelection(name)
+		}
+		var cmd tea.Cmd
+		a.nameInput, cmd = a.nameInput.Update(msg)
+		return a, cmd
+	}
+
 	switch msg.String() {
 	case "ctrl+c", "q":
 		return a, tea.Quit
@@ -173,7 +304,7 @@ func (a *app) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.viewport, cmd = a.viewport.Update(msg)
 		return a, cmd
 
-	case modeCategorizing, modeSuggesting:
+	case modeCategorizing, modeSuggesting, modeCreating:
 		if msg.String() == "esc" {
 			a.status = "Still running in the background. Esc again once it finishes."
 		}
@@ -209,6 +340,13 @@ func (a *app) selectCurrent() (tea.Model, tea.Cmd) {
 			return a.startCategorizing(true)
 		case actSuggest:
 			return a.startSuggesting()
+		case actPick:
+			a.mode = modeLoadingVideos
+			a.pickNextToken = ""
+			a.pickTotal = 0
+			a.pickLoaded = 0
+			a.pickDelegate = newCheckDelegate()
+			return a, loadPickerPageCmd(a.client, a.selected.Id, "")
 		}
 	case modeVideos:
 		if err := yt.OpenURL(i.value); err != nil {
@@ -253,6 +391,77 @@ func (a *app) startCategorizing(fresh bool) (tea.Model, tea.Cmd) {
 	return a, tea.Batch(
 		waitCategoryProgress(progressCh),
 		waitCategoryDone(doneCh),
+	)
+}
+
+func (a *app) openNamePrompt() (tea.Model, tea.Cmd) {
+	ti := textinput.New()
+	ti.Placeholder = fmt.Sprintf("%s (picks)", a.selectedTitle())
+	ti.SetValue(fmt.Sprintf("%s (picks)", a.selectedTitle()))
+	ti.Focus()
+	ti.CharLimit = 100
+	ti.Width = 40
+	a.nameInput = ti
+	a.mode = modeNamePrompt
+	a.status = ""
+	return a, textinput.Blink
+}
+
+func (a *app) startCreateFromSelection(name string) (tea.Model, tea.Cmd) {
+	if a.selected == nil || a.pickDelegate == nil {
+		a.status = "Nothing to create."
+		return a, nil
+	}
+
+	// Snapshot the chosen video IDs, preserving the playlist's original order.
+	chosen := chosenInOrder(a.list.Items(), a.pickDelegate.checked)
+
+	a.mode = modeCreating
+	a.progress.Reset()
+	a.viewport.SetContent("Creating your playlist...")
+	a.viewport.GotoBottom()
+
+	progressCh := make(chan string, 16)
+	doneCh := make(chan rangeDoneMsg, 1)
+	a.progressCh = progressCh
+	progressFn := func(format string, args ...any) {
+		progressCh <- fmt.Sprintf(format, args...)
+	}
+
+	client := a.client
+	sourceTitle := a.selectedTitle()
+
+	go func() {
+		defer close(progressCh)
+		ctx := context.Background()
+
+		progressFn("Creating new playlist %q...", name)
+		created, err := client.CreatePlaylist(ctx, name,
+			fmt.Sprintf("Created by Bubbles from selected videos in %q.", sourceTitle))
+		if err != nil {
+			doneCh <- rangeDoneMsg{err: err}
+			return
+		}
+
+		added := 0
+		for _, it := range chosen {
+			if it.videoID == "" {
+				continue
+			}
+			if err := client.AddToPlaylist(ctx, created.Id, it.videoID); err != nil {
+				progressFn("Failed to add %q: %v", it.title, err)
+				continue
+			}
+			added++
+			progressFn("Added (%d/%d): %s", added, len(chosen), it.title)
+		}
+
+		doneCh <- rangeDoneMsg{title: name, playlistID: created.Id, added: added, err: nil}
+	}()
+
+	return a, tea.Batch(
+		waitCategoryProgress(progressCh),
+		waitRangeDone(doneCh),
 	)
 }
 
@@ -332,6 +541,59 @@ func (a *app) onVideosLoaded(msg videosLoadedMsg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+func (a *app) onPickerLoaded(msg pickerLoadedMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		a.status = "Failed to load videos: " + msg.err.Error()
+		a.mode = modeActions
+		a.rebuildList(actionItems(), fmt.Sprintf("Actions — %s", a.selectedTitle()))
+		return a, nil
+	}
+
+	newItems := make([]list.Item, 0, len(msg.items))
+	for _, it := range msg.items {
+		title := it.Snippet.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		vid := ""
+		if it.Snippet.ResourceId != nil {
+			vid = it.Snippet.ResourceId.VideoId
+		}
+		newItems = append(newItems, item{title: title, desc: "Space to select", videoID: vid})
+	}
+
+	a.pickNextToken = msg.nextToken
+	if msg.total > 0 {
+		a.pickTotal = msg.total
+	}
+
+	firstPage := a.mode != modePicking
+	if firstPage {
+		// First page: build the list fresh.
+		a.mode = modePicking
+		if a.pickDelegate == nil {
+			a.pickDelegate = newCheckDelegate()
+		}
+		a.list = list.New(newItems, a.pickDelegate, a.width, a.height-3)
+		a.list.SetFilteringEnabled(true)
+		a.list.SetShowFilter(true)
+	} else {
+		// Subsequent pages: append to what's already loaded.
+		existing := a.list.Items()
+		a.list.SetItems(append(existing, newItems...))
+	}
+
+	a.pickLoaded = len(a.list.Items())
+	a.list.Title = fmt.Sprintf("Pick videos — %s (%d/%d loaded)", a.selectedTitle(), a.pickLoaded, a.pickTotal)
+
+	if a.pickNextToken == "" {
+		a.status = fmt.Sprintf("All %d videos loaded · %d selected", a.pickLoaded, a.pickDelegate.count())
+	} else {
+		a.status = fmt.Sprintf("%d/%d loaded · press m for more · %d selected", a.pickLoaded, a.pickTotal, a.pickDelegate.count())
+	}
+	return a, nil
+}
+
 func (a *app) onCategoryDone(msg categoryDoneMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		a.status = "Classification failed: " + msg.err.Error()
@@ -362,10 +624,28 @@ func (a *app) onSuggestDone(msg suggestDoneMsg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+func (a *app) onRangeDone(msg rangeDoneMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		a.status = "Create playlist failed: " + msg.err.Error()
+		a.mode = modeActions
+		a.rebuildList(actionItems(), fmt.Sprintf("Actions — %s", a.selectedTitle()))
+		return a, nil
+	}
+	a.mode = modeReport
+	url := "https://www.youtube.com/playlist?list=" + msg.playlistID
+	a.report = fmt.Sprintf(
+		"Created playlist: %s\n\nAdded %d videos.\n\nOpen it here:\n%s\n\n(Press Esc to go back.)",
+		msg.title, msg.added, url,
+	)
+	a.viewport.SetContent(a.report)
+	a.viewport.GotoTop()
+	a.status = fmt.Sprintf("Created %q with %d videos", msg.title, msg.added)
+	return a, nil
+}
+
 func (a *app) rebuildList(items []list.Item, title string) {
+	a.list = list.New(items, list.NewDefaultDelegate(), a.width, a.height-3)
 	a.list.Title = title
-	a.list.SetItems(items)
-	a.list.ResetSelected()
 	a.list.SetShowFilter(false)
 	a.list.SetFilteringEnabled(false)
 }
@@ -384,12 +664,21 @@ func (a *app) View() string {
 		body = lipgloss.NewStyle().Padding(1).Render(a.spinner.View() + " Loading your playlists...")
 	case modeLoadingVideos:
 		body = lipgloss.NewStyle().Padding(1).Render(a.spinner.View() + " Loading videos...")
-	case modePlaylists, modeActions, modeVideos:
+	case modePlaylists, modeActions, modeVideos, modePicking:
 		body = a.list.View()
 	case modeCategorizing:
 		body = lipgloss.NewStyle().Padding(0, 1).Render(a.spinner.View()+" Classifying...") + "\n\n" + a.viewport.View()
 	case modeSuggesting:
 		body = lipgloss.NewStyle().Padding(0, 1).Render(a.spinner.View()+" Generating suggestions...") + "\n\n" + a.viewport.View()
+	case modeCreating:
+		body = lipgloss.NewStyle().Padding(0, 1).Render(a.spinner.View()+" Creating playlist...") + "\n\n" + a.viewport.View()
+	case modeNamePrompt:
+		n := 0
+		if a.pickDelegate != nil {
+			n = a.pickDelegate.count()
+		}
+		prompt := fmt.Sprintf("Name for the new playlist (%d videos):", n)
+		body = lipgloss.NewStyle().Padding(1).Render(prompt + "\n\n" + a.nameInput.View())
 	case modeReport:
 		body = a.viewport.View()
 	}
@@ -414,6 +703,12 @@ func (a *app) helpText() string {
 		return "Classifying... (this can take a minute or two) · ctrl+c quit"
 	case modeSuggesting:
 		return "Generating suggestions... · ctrl+c quit"
+	case modeCreating:
+		return "Creating playlist... · ctrl+c quit"
+	case modePicking:
+		return "↑/↓ move · Space select · m load 50 more · / filter · c create · Esc back · ctrl+c quit"
+	case modeNamePrompt:
+		return "Type a name · Enter create · Esc back · ctrl+c quit"
 	case modeReport:
 		return "↑/↓ scroll · Esc back · q quit"
 	}
@@ -454,6 +749,7 @@ func actionItems() []list.Item {
 		item{title: "Categorize", desc: "Classify into Party/Love/Workout/Chill/Sad/Other (uses saved cache)", value: actCategorize},
 		item{title: "Re-categorize", desc: "Force a fresh classification, ignoring the saved cache", value: actReCat},
 		item{title: "Suggest", desc: "Discover songs you're missing based on this playlist", value: actSuggest},
+		item{title: "Pick videos → new playlist", desc: "Hand-pick videos with Space, then create a new playlist from them", value: actPick},
 	}
 }
 
@@ -480,6 +776,13 @@ type videosLoadedMsg struct {
 	err   error
 }
 
+type pickerLoadedMsg struct {
+	items     []*youtube.PlaylistItem
+	nextToken string
+	total     int64
+	err       error
+}
+
 type categoryProgressMsg struct {
 	line string
 }
@@ -492,6 +795,13 @@ type categoryDoneMsg struct {
 type suggestDoneMsg struct {
 	recs []analyze.Recommendation
 	err  error
+}
+
+type rangeDoneMsg struct {
+	title      string
+	playlistID string
+	added      int
+	err        error
 }
 
 func loadPlaylistsCmd(cl *yt.Client) tea.Cmd {
@@ -507,6 +817,14 @@ func loadVideosCmd(cl *yt.Client, playlistID string) tea.Cmd {
 		ctx := context.Background()
 		items, err := cl.PlaylistVideos(ctx, playlistID)
 		return videosLoadedMsg{items: items, err: err}
+	}
+}
+
+func loadPickerPageCmd(cl *yt.Client, playlistID, pageToken string) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		items, next, total, err := cl.PlaylistVideosPage(ctx, playlistID, pageToken, 50)
+		return pickerLoadedMsg{items: items, nextToken: next, total: total, err: err}
 	}
 }
 
@@ -527,6 +845,12 @@ func waitCategoryDone(ch <-chan categoryDoneMsg) tea.Cmd {
 }
 
 func waitSuggestDone(ch <-chan suggestDoneMsg) tea.Cmd {
+	return func() tea.Msg {
+		return <-ch
+	}
+}
+
+func waitRangeDone(ch <-chan rangeDoneMsg) tea.Cmd {
 	return func() tea.Msg {
 		return <-ch
 	}
