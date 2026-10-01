@@ -146,6 +146,51 @@ func (c *Client) AddToPlaylist(ctx context.Context, playlistID, videoID string) 
 	return nil
 }
 
+// RemoveFromPlaylist deletes a playlist item by its playlist-item ID (not the
+// video ID). Get the ID from PlaylistItem.Id.
+func (c *Client) RemoveFromPlaylist(ctx context.Context, playlistItemID string) error {
+	if err := c.svc.PlaylistItems.Delete(playlistItemID).Context(ctx).Do(); err != nil {
+		return fmt.Errorf("unable to remove playlist item %s: %v", playlistItemID, err)
+	}
+	return nil
+}
+
+// SearchResult is a trimmed video search hit.
+type SearchResult struct {
+	VideoID string
+	Title   string
+	Channel string
+}
+
+// Search returns up to maxResults video results for the query. Note:
+// search.list costs 100 quota units per call.
+func (c *Client) Search(ctx context.Context, query string, maxResults int64) ([]SearchResult, error) {
+	if maxResults <= 0 || maxResults > 25 {
+		maxResults = 5
+	}
+	resp, err := c.svc.Search.List([]string{"snippet"}).
+		Q(query).
+		Type("video").
+		MaxResults(maxResults).
+		Context(ctx).
+		Do()
+	if err != nil {
+		return nil, fmt.Errorf("search failed for %q: %v", query, err)
+	}
+	var out []SearchResult
+	for _, it := range resp.Items {
+		if it.Id == nil || it.Id.VideoId == "" || it.Snippet == nil {
+			continue
+		}
+		out = append(out, SearchResult{
+			VideoID: it.Id.VideoId,
+			Title:   it.Snippet.Title,
+			Channel: it.Snippet.ChannelTitle,
+		})
+	}
+	return out, nil
+}
+
 func (c *Client) Videos(ctx context.Context, ids []string) (map[string]*youtube.Video, error) {
 	byID := make(map[string]*youtube.Video)
 	const batch = 50
