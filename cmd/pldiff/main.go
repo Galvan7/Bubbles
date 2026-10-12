@@ -26,7 +26,8 @@ import (
 
 var tracked = []struct{ name, id string }{
 	{"Drive", "PLWTzzjcQOUAlKNQsF2mDjASo8tiQ9WRFz"},
-	{"Love Songs", "PLCkZslETyLLk"},
+	{"Peak Delusion", "PLCkZslETyLLk"},
+	{"Old Is Gold", "PLWTzzjcQOUAmPdSniAjIB8eFcSfNT-dRU"},
 }
 
 const snapDir = "snapshots"
